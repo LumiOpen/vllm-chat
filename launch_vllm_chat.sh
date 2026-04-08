@@ -45,9 +45,9 @@ echo ""
 SCRIPT_DIR="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 source "$SCRIPT_DIR/lumi_launcher.sh"
 
-echo "Installing gradio (container)..."
-run_sing_pip_install "gradio>=4" brotli "huggingface-hub<1.0" "numpy<2.3"
-echo "Gradio installed."
+echo "Installing Python dependencies (container)..."
+run_sing_pip_install -r "$SCRIPT_DIR/requirements.txt"
+echo "Dependencies installed."
 
 srun -l bash -c '
     source '"$SCRIPT_DIR"'/lumi_launcher.sh

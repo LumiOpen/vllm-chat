@@ -194,6 +194,10 @@ def parse_vllm_sse_line(line: str):
 
 
 def format_chat_prompt(msgs: List[Dict[str, str]], tokenizer) -> str:
+    # Strip trailing empty assistant placeholder so the template only adds
+    # one generation prompt (not an empty turn + another prompt).
+    if msgs and msgs[-1]["role"] == "assistant" and not msgs[-1]["content"]:
+        msgs = msgs[:-1]
     return tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
 
 
@@ -259,7 +263,7 @@ def _stream_single(history: List[Dict], model_idx: int,
     tok = tokenizers[model_idx]
     port = ports[model_idx]
 
-    history = history + [{"role": "assistant", "content": ""}]
+    history = list(history) + [{"role": "assistant", "content": ""}]
     history = truncate_history(history, tok, max_tokens)
 
     payload = {
@@ -274,28 +278,33 @@ def _stream_single(history: List[Dict], model_idx: int,
     }
 
     url = f"http://localhost:{port}/v1/completions"
-    buffer, lock, done = [""], threading.Lock(), [False]
-    threading.Thread(
-        target=stream_from_server, args=(url, payload, buffer, lock, done), daemon=True
-    ).start()
-
-    while not done[0]:
-        with lock:
-            cur = buffer[0]
-        if history[-1]["content"] != cur:
-            history[-1]["content"] = cur
-            yield history
-        time.sleep(0.1)
-
-    history[-1]["content"] = buffer[0]
+    last_yield = time.monotonic()
+    try:
+        with requests.post(url, json=payload, stream=True) as resp:
+            for raw in resp.iter_lines(decode_unicode=True):
+                if not raw:
+                    continue
+                for data in parse_vllm_sse_line(raw):
+                    if data is None:
+                        yield history
+                        return
+                    token = data.get("choices", [{}])[0].get("text", "")
+                    if token:
+                        history[-1]["content"] += token
+                        now = time.monotonic()
+                        if now - last_yield >= 0.05:
+                            yield history
+                            last_yield = now
+    except Exception as e:
+        print("Streaming error:", e)
     yield history
 
 
 def _stream_dual(hist1: List[Dict], hist2: List[Dict],
                  temp: float, top_p: float, top_k: int, max_tokens: int):
     """Add assistant placeholders to both histories and stream. Yields (h1, h2)."""
-    hist1 = hist1 + [{"role": "assistant", "content": ""}]
-    hist2 = hist2 + [{"role": "assistant", "content": ""}]
+    hist1 = list(hist1) + [{"role": "assistant", "content": ""}]
+    hist2 = list(hist2) + [{"role": "assistant", "content": ""}]
 
     hist1 = truncate_history(hist1, tokenizer1, max_tokens)
     hist2 = truncate_history(hist2, tokenizer2, max_tokens)
@@ -330,20 +339,10 @@ def _stream_dual(hist1: List[Dict], hist2: List[Dict],
 
     while not (done1[0] and done2[0]):
         with lock1:
-            cur1 = buf1[0]
+            hist1[-1]["content"] = buf1[0]
         with lock2:
-            cur2 = buf2[0]
-
-        updated = False
-        if hist1[-1]["content"] != cur1:
-            hist1[-1]["content"] = cur1
-            updated = True
-        if hist2[-1]["content"] != cur2:
-            hist2[-1]["content"] = cur2
-            updated = True
-
-        if updated:
-            yield hist1, hist2
+            hist2[-1]["content"] = buf2[0]
+        yield hist1, hist2
         time.sleep(0.1)
 
     hist1[-1]["content"] = buf1[0]
@@ -591,6 +590,7 @@ with gr.Blocks() as demo:
             [mode_radio],
             [chatbot1, chatbot2, model_dropdown],
             show_progress="hidden",
+            queue=False,
         )
 
 
