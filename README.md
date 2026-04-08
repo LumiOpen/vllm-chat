@@ -1,17 +1,20 @@
 # vLLM Chat Interface on LUMI
 
-A Gradio-based chat UI powered by [vLLM](https://github.com/vllm-project/vllm) running on LUMI's AMD MI250X GPUs. Supports any HuggingFace model with a chat template.
+A Gradio-based chat UI powered by [vLLM](https://github.com/vllm-project/vllm) running on LUMI's AMD MI250X GPUs. Supports any HuggingFace model with a chat template, with single-model and side-by-side dual-model comparison modes in a single unified interface.
 
 Uses the [LUMI AI Factory container](https://lumi-supercomputer.github.io/LUMI-AI-Guide/) (Ubuntu 24.04, ROCm 6.4, PyTorch, vLLM) via the shared `lumi_launcher.sh` environment.
 
 ## Quick Start
 
 ```bash
-# Default model (LumiOpen/Llama-Poro-2-8B-Math-Reasoning-SFT-rc1, 1 GPU)
+# Single model (default: LumiOpen/Llama-Poro-2-8B-Math-Reasoning-SFT-rc1, 1 GPU)
 sbatch launch_vllm_chat.sh
 
-# Custom model and GPU count via arguments
+# Custom model and GPU count
 sbatch launch_vllm_chat.sh meta-llama/Llama-3.1-8B-Instruct 2
+
+# Dual model comparison
+sbatch launch_vllm_chat.sh meta-llama/Llama-3.1-8B-Instruct 1 Qwen/Qwen2.5-7B-Instruct 1
 ```
 
 Once the job is running, a **public Gradio URL** (e.g. `https://xxxxx.gradio.live`) will appear in the log. Open it in any browser to start chatting.
@@ -40,10 +43,14 @@ Any HuggingFace model compatible with vLLM can be used. It should have a tokeniz
 
 ### Step 2: Submit the job
 
-The launcher accepts the model ID and GPU count as positional arguments:
+The launcher accepts positional arguments for single or dual model:
 
 ```bash
+# Single model
 sbatch launch_vllm_chat.sh <MODEL_ID> <GPU_COUNT>
+
+# Dual model comparison
+sbatch launch_vllm_chat.sh <MODEL1_ID> <GPU_COUNT1> <MODEL2_ID> <GPU_COUNT2>
 ```
 
 Or edit the defaults in the `### config` section of `launch_vllm_chat.sh`:
@@ -86,10 +93,8 @@ Open this URL in your browser. The link is valid for 72 hours or until the job e
 
 | File | Purpose |
 |---|---|
-| `launch_vllm_chat.sh` | SLURM job script — sources `lumi_launcher.sh`, installs Gradio, runs `vllm_chat.py` |
-| `vllm_chat.py` | Gradio chat app — launches vLLM as subprocess, streams responses |
-| `launch_vllm_chat_dual.sh` | SLURM launcher for side-by-side dual-model comparison |
-| `vllm_chat_dual.py` | Dual-model Gradio chat app |
+| `launch_vllm_chat.sh` | SLURM job script — accepts 1 or 2 models, sources `lumi_launcher.sh`, installs Gradio, runs `vllm_chat.py` |
+| `vllm_chat.py` | Unified Gradio chat app — single-model and dual-model comparison in one interface |
 | `logs/` | SLURM stdout/stderr (created at runtime) |
 
 ### Launcher
@@ -99,18 +104,18 @@ Open this URL in your browser. The link is valid for 72 hours or until the job e
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────┐
-│  LUMI compute node (Singularity/Apptainer)      │
-│  LUMI AI Factory container (ROCm 6.4, vLLM)    │
-│                                                 │
-│  ┌─────────────┐       ┌─────────────────────┐  │
-│  │  Gradio UI  │──HTTP──│  vLLM OpenAI Server │  │
-│  │ (share=True)│       │  localhost:8001      │  │
-│  └──────┬──────┘       └────────┬────────────┘  │
-│         │                       │                │
-│    Public URL             AMD MI250X GPUs        │
-│  (gradio.live)          (tensor parallelism)     │
-└─────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────┐
+│  LUMI compute node (Singularity/Apptainer)          │
+│  LUMI AI Factory container (ROCm 6.4, vLLM)        │
+│                                                     │
+│  ┌─────────────┐       ┌──────────────────────────┐ │
+│  │  Gradio UI  │──HTTP──│  vLLM Server(s)         │ │
+│  │ (share=True)│       │  :8001 [+ :8002]         │ │
+│  └──────┬──────┘       └────────┬─────────────────┘ │
+│         │                       │                    │
+│    Public URL             AMD MI250X GPUs            │
+│  (gradio.live)          (tensor parallelism)         │
+└─────────────────────────────────────────────────────┘
          │
     ┌────┴────┐
     │ Browser │
@@ -120,15 +125,20 @@ Open this URL in your browser. The link is valid for 72 hours or until the job e
 1. SLURM allocates a node with GPUs
 2. `lumi_launcher.sh` sets up the container environment (bind mounts, caches, env vars)
 3. Gradio is pip-installed into the container's `/tmp/pip-packages`
-4. `vllm_chat.py` starts a vLLM OpenAI-compatible API server as a subprocess
+4. `vllm_chat.py` starts 1 or 2 vLLM OpenAI-compatible API servers as subprocesses
 5. After health checks pass, Gradio launches with `share=True` creating a public tunnel
 6. Messages are formatted with the model's chat template and streamed via `/v1/completions`
 
 ## UI Features
 
+- **Single & dual mode** — chat with one model or compare two side by side
+- **Mode switching** — toggle between single and dual when two models are deployed
+- **Model selector** — in single mode with two models, choose which one to chat with
+- **Generation parameters** — adjust temperature, top-p, top-k, and max tokens via the Settings accordion
 - **Streaming responses** — tokens appear as they are generated
 - **Regenerate** — re-run the last response with a new random seed
 - **Delete last** — remove the most recent message
+- **Edit last** — pop the last user message back into the input box for editing
 - **Clear** — reset the conversation
 - **Auto context trimming** — long conversations are truncated to fit the context window
 - **Concurrent users** — up to 16 simultaneous sessions via Gradio queue

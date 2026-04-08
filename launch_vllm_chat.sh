@@ -1,13 +1,13 @@
 #!/bin/bash
 #SBATCH --job-name=vllm_chat
 #SBATCH --account=project_462000963
-#SBATCH --partition=dev-g
-#SBATCH --time=00:30:00
+#SBATCH --partition=standard-g
+#SBATCH --time=08:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=7
 #SBATCH --mem=480G
-#SBATCH --gpus-per-node=mi250:8
+#SBATCH --gpus-per-node=mi250:2
 #SBATCH --exclusive=user
 #SBATCH --hint=nomultithread
 #SBATCH --output=logs/%j.out
@@ -15,17 +15,31 @@
 
 set -euxo pipefail
 
-### config — edit these for your model
+### config — edit these for your model(s)
 MODEL="${1:-LumiOpen/Llama-Poro-2-8B-Math-Reasoning-SFT-rc1}"
 GPUS="${2:-1}"
+MODEL2="${3:-LumiOpen/Llama-Poro-2-Long-Instruct-SFT}"
+GPUS2="${4:-1}"
 ### end config
+
+# Determine single vs dual mode
+if [ -n "$MODEL2" ] && [ -n "$GPUS2" ]; then
+    DUAL=1
+    TOTAL_GPUS=$(( GPUS + GPUS2 ))
+else
+    DUAL=0
+    TOTAL_GPUS=$GPUS
+fi
 
 echo "======================================="
 echo "vLLM Chat Interface"
 echo "======================================="
 echo "Started: $(date)"
-echo "Model:   $MODEL"
-echo "GPUs:    $GPUS"
+echo "Model 1: $MODEL ($GPUS GPUs)"
+if [ "$DUAL" -eq 1 ]; then
+    echo "Model 2: $MODEL2 ($GPUS2 GPUs)"
+fi
+echo "Total GPUs: $TOTAL_GPUS"
 echo ""
 
 SCRIPT_DIR="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
@@ -50,7 +64,7 @@ srun -l bash -c '
         LOCALID=${SLURM_LOCALID:-0}
 
         GPU_IDS=""
-        for (( i=0; i<'"$GPUS"'; i++ )); do
+        for (( i=0; i<'"$TOTAL_GPUS"'; i++ )); do
             if [ -z "$GPU_IDS" ]; then
                 GPU_IDS="$i"
             else
@@ -64,7 +78,11 @@ srun -l bash -c '
         export MASTER_PORT=$(( 7000 + LOCALID ))
 
         echo "Launching vLLM chat on GPUs $GPU_IDS"
-        run_python -u /workspace/vllm_chat.py '"$GPUS"':'"$MODEL"'
+        if [ '"$DUAL"' -eq 1 ]; then
+            run_python -u /workspace/vllm_chat.py '"$GPUS"':'"$MODEL"' '"$GPUS2"':'"$MODEL2"'
+        else
+            run_python -u /workspace/vllm_chat.py '"$GPUS"':'"$MODEL"'
+        fi
     '\''
 '
 

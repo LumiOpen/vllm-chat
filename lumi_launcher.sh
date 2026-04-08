@@ -79,7 +79,11 @@ setup_singularity_environment() {
     export SINGULARITYENV_HF_HOME="/project/cache"
     export SINGULARITYENV_HUGGINGFACE_HUB_CACHE="/project/cache/hub"
     export SINGULARITYENV_HF_HUB_DISABLE_XET=1
-    [ -n "${HF_TOKEN:-}" ] && export SINGULARITYENV_HF_TOKEN="$HF_TOKEN"
+    if [ -n "${HF_TOKEN:-}" ]; then
+        { set +x; } 2>/dev/null
+        export SINGULARITYENV_HF_TOKEN="$HF_TOKEN"
+        set -x
+    fi
 
     # vLLM settings
     export SINGULARITYENV_VLLM_USE_V1="${VLLM_USE_V1:-1}"
