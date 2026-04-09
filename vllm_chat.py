@@ -256,7 +256,7 @@ def _stream_to_buffer(url, payload, buffer, lock, done):
     """Thread target: POST to vLLM and accumulate tokens in buffer[0]."""
     try:
         with requests.post(url, json=payload, stream=True) as resp:
-            for raw in resp.iter_lines(decode_unicode=True):
+            for raw in resp.iter_lines(chunk_size=1, decode_unicode=True):
                 if not raw:
                     continue
                 for data in parse_vllm_sse_line(raw):
@@ -305,8 +305,8 @@ def user_submit(user_msg, mode, model_choice, hist1, hist2):
 
 def bot_respond(mode, model_choice, hist1, hist2,
                 temp, top_p, top_k, max_tokens):
-    """Stream assistant response.  Modifies hist1/hist2 IN PLACE and yields
-    the *same* objects back — this is critical for Gradio's streaming to work.
+    """Stream assistant response using the official Gradio 6 pattern:
+    append an empty assistant message, mutate content in-place, yield history.
     """
     midx = _resolve_model_idx(mode, model_choice)
     _log(f"bot_respond: midx={midx}, hist1_len={len(hist1)}, hist2_len={len(hist2)}")
@@ -318,6 +318,7 @@ def bot_respond(mode, model_choice, hist1, hist2,
 
         hist1.append({"role": "assistant", "content": ""})
         hist2.append({"role": "assistant", "content": ""})
+        yield hist1, hist2
 
         buf1, lock1, done1 = [""], threading.Lock(), [False]
         buf2, lock2, done2 = [""], threading.Lock(), [False]
@@ -328,22 +329,25 @@ def bot_respond(mode, model_choice, hist1, hist2,
         threading.Thread(target=_stream_to_buffer, daemon=True,
                          args=(f"http://localhost:{ports[1]}/v1/completions", pay2, buf2, lock2, done2)).start()
 
+        yield_count = 0
         while not (done1[0] and done2[0]):
             with lock1:
                 hist1[-1]["content"] = buf1[0]
             with lock2:
                 hist2[-1]["content"] = buf2[0]
+            yield_count += 1
             yield hist1, hist2
-            time.sleep(0.1)
+            time.sleep(0.05)
 
         hist1[-1]["content"] = buf1[0]
         hist2[-1]["content"] = buf2[0]
-        _log(f"bot_respond dual done: buf1={len(buf1[0])}, buf2={len(buf2[0])}")
+        _log(f"bot_respond dual done: buf1={len(buf1[0])}, buf2={len(buf2[0])}, yields={yield_count}")
         yield hist1, hist2
     else:
         # ── Single mode ────────────────────────────────────────────
         prompt = _build_prompt(hist1, midx, max_tokens)
         hist1.append({"role": "assistant", "content": ""})
+        yield hist1, hist2
 
         payload = _make_payload(midx, prompt, temp, top_p, top_k, max_tokens)
         url = f"http://localhost:{ports[midx]}/v1/completions"
@@ -351,14 +355,16 @@ def bot_respond(mode, model_choice, hist1, hist2,
         _log(f"bot_respond single: POST {url}")
         last_yield = time.monotonic()
         token_count = 0
+        yield_count = 0
         try:
             with requests.post(url, json=payload, stream=True) as resp:
-                for raw in resp.iter_lines(decode_unicode=True):
+                for raw in resp.iter_lines(chunk_size=1, decode_unicode=True):
                     if not raw:
                         continue
                     for data in parse_vllm_sse_line(raw):
                         if data is None:
-                            _log(f"bot_respond single done: {token_count} tokens")
+                            yield_count += 1
+                            _log(f"bot_respond single done: {token_count} tokens, {yield_count} yields")
                             yield hist1, hist2
                             return
                         token = data.get("choices", [{}])[0].get("text", "")
@@ -367,6 +373,7 @@ def bot_respond(mode, model_choice, hist1, hist2,
                             hist1[-1]["content"] += token
                             now = time.monotonic()
                             if now - last_yield >= 0.05:
+                                yield_count += 1
                                 yield hist1, hist2
                                 last_yield = now
         except Exception as e:
@@ -561,12 +568,13 @@ if __name__ == "__main__":
         share=True, server_name="0.0.0.0", prevent_thread_lock=True,
     )
 
-    if not _share:
-        print()
-        print("=" * 64)
-        print(f"  SSH tunnel:  ssh -L 7860:{hostname}:7860 <user>@lumi.csc.fi")
-        print(f"  Then open:   http://localhost:7860")
-        print("=" * 64)
-        print()
+    print()
+    print("=" * 64)
+    print(f"  SSH tunnel:  ssh -L 7860:{hostname}:7860 <user>@lumi.csc.fi")
+    print(f"  Then open:   http://localhost:7860")
+    if _share:
+        print(f"  (If streaming doesn't work via the share link, try SSH tunnel)")
+    print("=" * 64)
+    print()
 
     demo.block_thread()

@@ -19,6 +19,8 @@ sbatch launch_vllm_chat.sh meta-llama/Llama-3.1-8B-Instruct 1 Qwen/Qwen2.5-7B-In
 
 Once the job is running, a **public Gradio URL** (e.g. `https://xxxxx.gradio.live`) will appear in the log. Open it in any browser to start chatting.
 
+> **Note:** The `gradio.live` share link does **not** support real-time token streaming — you will see a typing indicator until the full response is ready. For live token-by-token streaming, use an SSH tunnel instead (see [Connecting via SSH tunnel](#connecting-via-ssh-tunnel) below).
+
 ## Deploying a Custom Model
 
 ### Step 1: Pick a model
@@ -87,7 +89,27 @@ Look for:
 Running on public URL: https://xxxxxxxxxx.gradio.live
 ```
 
-Open this URL in your browser. The link is valid for 72 hours or until the job ends.
+Open this URL in your browser. The link is valid for 1 week or until the job ends.
+
+#### Connecting via SSH tunnel
+
+The `gradio.live` share link works for basic use but **does not stream tokens in real time** — the Gradio relay proxy buffers SSE (Server-Sent Events), so the UI shows a typing indicator until the full response is ready, then displays it all at once.
+
+For **live token-by-token streaming**, use an SSH tunnel. The log prints the exact command:
+
+```
+================================================================
+  SSH tunnel:  ssh -L 7860:nid005005:7860 <user>@lumi.csc.fi
+  Then open:   http://localhost:7860
+================================================================
+```
+
+Run the SSH command from your local machine (replace `nid005005` and `<user>` with the actual values from the log), then open `http://localhost:7860` in your browser. If local port 7860 is already in use, pick another:
+
+```bash
+ssh -L 7861:nid005005:7860 <user>@lumi.csc.fi
+# then open http://localhost:7861
+```
 
 ## Project Structure
 
@@ -155,6 +177,9 @@ The `dev-g` partition has limited slots. Check with `squeue -p dev-g`. Consider 
 
 ### No Gradio URL
 Check `logs/<JOB_ID>.err`. Common cause: Gradio couldn't reach its relay server. The `run_sing_pip_install "gradio>=4"` step in the launcher ensures a fresh install.
+
+### No token streaming (typing dots, then full response appears)
+The `gradio.live` share tunnel buffers Gradio's SSE stream, preventing real-time token delivery to the browser. This is a limitation of the relay proxy, not the application. Use an SSH tunnel for streaming — see [Connecting via SSH tunnel](#connecting-via-ssh-tunnel).
 
 ### Slow first response
 First inference triggers ROCm kernel JIT compilation. Subsequent responses are faster.
