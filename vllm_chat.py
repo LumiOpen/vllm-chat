@@ -444,18 +444,19 @@ def clear_all():
     return [], []
 
 
-def switch_mode(mode):
+def switch_mode(mode, model_choice):
     is_dual = mode == "Dual Model"
+    label1 = model_name1 if is_dual else model_choice
     return (
-        [],
+        gr.Chatbot(value=[], label=label1),
         gr.Chatbot(value=[], visible=is_dual),
         gr.Dropdown(visible=not is_dual),
     )
 
 
 def on_model_change(model_choice):
-    """Clear chatbot1 when the selected model changes in single mode."""
-    return []
+    """Clear chatbot1 and update its label when the selected model changes."""
+    return gr.Chatbot(value=[], label=model_choice)
 
 
 ###############################################################################
@@ -465,42 +466,31 @@ def on_model_change(model_choice):
 _log(f"Gradio version: {gr.__version__}")
 
 with gr.Blocks() as demo:
-    gr.Markdown("## vLLM Chat Interface")
 
-    if num_models == 2:
-        gr.Markdown(
-            f"**Model A**: {model_name1} ({gpu_count_1} GPU(s)) &nbsp;&nbsp; "
-            f"**Model B**: {model_name2} ({gpu_count_2} GPU(s))"
-        )
-    else:
-        gr.Markdown(f"**Model**: {model_name1} ({gpu_count_1} GPU(s))")
-
-    with gr.Accordion("Settings", open=True):
-        with gr.Row():
-            if num_models == 2:
-                mode_radio = gr.Radio(
-                    choices=["Single Model", "Dual Model"],
-                    value="Single Model", label="Mode",
-                )
-                model_dropdown = gr.Dropdown(
-                    choices=[model_name1, model_name2],
-                    value=model_name1, label="Model",
-                )
-            else:
-                mode_radio = gr.Radio(
-                    choices=["Single Model"], value="Single Model",
-                    label="Mode", visible=False,
-                )
-                model_dropdown = gr.Dropdown(
-                    choices=[model_name1], value=model_name1,
-                    label="Model", visible=False,
-                )
-        with gr.Row():
-            temp_slider = gr.Slider(0.0, 1.0, value=0.7, step=0.05, label="Temperature")
-            top_p_slider = gr.Slider(0.0, 1.0, value=0.9, step=0.01, label="Top-p")
-        with gr.Row():
-            top_k_slider = gr.Slider(-1, 100, value=40, step=1, label="Top-k")
-            max_tokens_slider = gr.Slider(2048, 65536, value=32768, step=1, label="Max tokens")
+    with gr.Sidebar(open=True):
+        gr.Markdown("## ⚙️ Settings")
+        if num_models == 2:
+            mode_radio = gr.Radio(
+                choices=["Single Model", "Dual Model"],
+                value="Single Model", label="Mode",
+            )
+            model_dropdown = gr.Dropdown(
+                choices=[model_name1, model_name2],
+                value=model_name1, label="Model",
+            )
+        else:
+            mode_radio = gr.Radio(
+                choices=["Single Model"], value="Single Model",
+                label="Mode", visible=False,
+            )
+            model_dropdown = gr.Dropdown(
+                choices=[model_name1], value=model_name1,
+                label="Model", visible=False,
+            )
+        temp_slider = gr.Slider(0.0, 1.0, value=0.7, step=0.05, label="Temperature")
+        top_p_slider = gr.Slider(0.0, 1.0, value=0.9, step=0.01, label="Top-p")
+        top_k_slider = gr.Slider(-1, 100, value=40, step=1, label="Top-k")
+        max_tokens_slider = gr.Slider(2048, 65536, value=32768, step=1, label="Max tokens")
 
     with gr.Row():
         chatbot1 = gr.Chatbot(label=model_name1, height=600)
@@ -545,7 +535,7 @@ with gr.Blocks() as demo:
 
     if num_models == 2:
         mode_radio.change(
-            switch_mode, [mode_radio],
+            switch_mode, [mode_radio, model_dropdown],
             [chatbot1, chatbot2, model_dropdown],
             queue=False,
         )
