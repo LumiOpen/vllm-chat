@@ -181,8 +181,43 @@ for port in ports:
 print("All health checks passed.")
 
 ###############################################################################
-# Helpers – prompt trimming & SSE parsing
+# Helpers – Gradio 6 content normalisation, prompt trimming, SSE parsing
 ###############################################################################
+
+
+def _normalize_content(content) -> str:
+    """Extract plain text from Gradio 6 structured content.
+
+    Gradio 6 wraps every message content as a list of typed blocks, e.g.
+        [{'text': 'hello', 'type': 'text'}]
+    This converts back to a plain string for the tokenizer / textbox.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                parts.append(item.get("text", ""))
+            elif isinstance(item, str):
+                parts.append(item)
+        return "".join(parts)
+    return str(content)
+
+
+def _normalize_history(history: list) -> List[Dict[str, str]]:
+    """Convert Gradio 6 structured messages to plain {role, content} dicts.
+
+    Gradio 6 returns chatbot values with extra keys (metadata, options)
+    and structured content blocks.  The tokenizer and vLLM expect plain
+    role/content dicts with string content.
+    """
+    out = []
+    for msg in history:
+        role = msg.get("role", "user") if isinstance(msg, dict) else "user"
+        content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
+        out.append({"role": role, "content": _normalize_content(content)})
+    return out
 
 
 def parse_vllm_sse_line(line: str):
@@ -277,17 +312,17 @@ def _resolve_model_idx(mode, model_choice):
 
 def _stream_single(history: List[Dict], model_idx: int,
                    temp: float, top_p: float, top_k: int, max_tokens: int):
-    """Add an assistant placeholder and stream tokens. Yields history."""
+    """Add an assistant placeholder and stream tokens. Yields history.
+
+    *history* is already normalised (plain role/content dicts).
+    """
     _log(f"_stream_single: ENTER model_idx={model_idx}, history has {len(history)} msgs")
-    for i, m in enumerate(history):
-        _log(f"  history[{i}]: role={m.get('role')}, type(content)={type(m.get('content')).__name__}, content_preview={str(m.get('content',''))[:80]}")
 
     tok = tokenizers[model_idx]
     port = ports[model_idx]
 
     history = list(history) + [{"role": "assistant", "content": ""}]
     history = truncate_history(history, tok, max_tokens)
-    _log(f"_stream_single: after truncate, history has {len(history)} msgs")
 
     prompt = format_chat_prompt(history, tok)
     _log(f"_stream_single: prompt length={len(prompt)} chars, first 200: {prompt[:200]}")
@@ -310,7 +345,7 @@ def _stream_single(history: List[Dict], model_idx: int,
     token_count = 0
     try:
         with requests.post(url, json=payload, stream=True) as resp:
-            _log(f"_stream_single: response status={resp.status_code}, headers={dict(resp.headers)}")
+            _log(f"_stream_single: response status={resp.status_code}")
             line_count = 0
             for raw in resp.iter_lines(decode_unicode=True):
                 if not raw:
@@ -330,8 +365,6 @@ def _stream_single(history: List[Dict], model_idx: int,
                         now = time.monotonic()
                         if now - last_yield >= 0.05:
                             yield_count += 1
-                            if yield_count <= 5:
-                                _log(f"_stream_single: yield #{yield_count}, tokens_so_far={token_count}, content_len={len(history[-1]['content'])}")
                             yield history
                             last_yield = now
             _log(f"_stream_single: iter_lines exhausted. lines={line_count}, tokens={token_count}, yields={yield_count}")
@@ -345,7 +378,10 @@ def _stream_single(history: List[Dict], model_idx: int,
 
 def _stream_dual(hist1: List[Dict], hist2: List[Dict],
                  temp: float, top_p: float, top_k: int, max_tokens: int):
-    """Add assistant placeholders to both histories and stream. Yields (h1, h2)."""
+    """Add assistant placeholders to both histories and stream. Yields (h1, h2).
+
+    Both histories are already normalised.
+    """
     _log(f"_stream_dual: ENTER hist1={len(hist1)} msgs, hist2={len(hist2)} msgs")
 
     hist1 = list(hist1) + [{"role": "assistant", "content": ""}]
@@ -408,12 +444,6 @@ def _stream_dual(hist1: List[Dict], hist2: List[Dict],
 def user_submit(user_msg, mode, model_choice, hist1, hist2):
     """Add the user message to the correct history and clear the textbox."""
     _log(f"user_submit: ENTER msg={user_msg!r}, mode={mode!r}, model_choice={model_choice!r}")
-    _log(f"  hist1: type={type(hist1).__name__}, len={len(hist1) if isinstance(hist1, list) else '?'}")
-    _log(f"  hist2: type={type(hist2).__name__}, len={len(hist2) if isinstance(hist2, list) else '?'}")
-    if hist1:
-        _log(f"  hist1[0]: type={type(hist1[0]).__name__}, value={hist1[0]!r}"[:200])
-    if hist2:
-        _log(f"  hist2[0]: type={type(hist2[0]).__name__}, value={hist2[0]!r}"[:200])
 
     if not user_msg or not user_msg.strip():
         _log("user_submit: empty msg, returning unchanged")
@@ -422,12 +452,12 @@ def user_submit(user_msg, mode, model_choice, hist1, hist2):
     midx = _resolve_model_idx(mode, model_choice)
     _log(f"user_submit: midx={midx}")
     if midx == -1:
-        hist1 = hist1 + [{"role": "user", "content": user_msg}]
-        hist2 = hist2 + [{"role": "user", "content": user_msg}]
-    elif midx == 0:
-        hist1 = hist1 + [{"role": "user", "content": user_msg}]
+        # Dual mode: add to both
+        hist1 = list(hist1) + [{"role": "user", "content": user_msg}]
+        hist2 = list(hist2) + [{"role": "user", "content": user_msg}]
     else:
-        hist2 = hist2 + [{"role": "user", "content": user_msg}]
+        # Single mode: always display in chatbot1 regardless of model
+        hist1 = list(hist1) + [{"role": "user", "content": user_msg}]
 
     _log(f"user_submit: EXIT returning hist1_len={len(hist1)}, hist2_len={len(hist2)}")
     return "", hist1, hist2
@@ -436,63 +466,51 @@ def user_submit(user_msg, mode, model_choice, hist1, hist2):
 def bot_respond(mode, model_choice, hist1, hist2,
                 temp, top_p, top_k, max_tokens):
     """Stream the assistant response. Histories already contain the user message."""
-    _log(f"bot_respond: ENTER mode={mode!r}, model_choice={model_choice!r}")
-    _log(f"  hist1: type={type(hist1).__name__}, len={len(hist1) if isinstance(hist1, list) else '?'}")
-    _log(f"  hist2: type={type(hist2).__name__}, len={len(hist2) if isinstance(hist2, list) else '?'}")
-    if hist1:
-        _log(f"  hist1[-1]: type={type(hist1[-1]).__name__}, value={hist1[-1]!r}"[:200])
-    if hist2:
-        _log(f"  hist2[-1]: type={type(hist2[-1]).__name__}, value={hist2[-1]!r}"[:200])
-    _log(f"  params: temp={temp}, top_p={top_p}, top_k={top_k}, max_tokens={max_tokens}")
+    _log(f"bot_respond: ENTER mode={mode!r}, model_choice={model_choice!r}, hist1_len={len(hist1)}, hist2_len={len(hist2)}")
 
     midx = _resolve_model_idx(mode, model_choice)
     _log(f"bot_respond: midx={midx}")
 
-    yield_count = 0
     if midx == -1:
-        for h1, h2 in _stream_dual(hist1, hist2, temp, top_p, top_k, max_tokens):
-            yield_count += 1
-            if yield_count <= 3:
-                _log(f"bot_respond(dual): yield #{yield_count}, h1_type={type(h1).__name__}, h2_type={type(h2).__name__}")
+        # Dual: normalise both, stream both
+        h1 = _normalize_history(hist1)
+        h2 = _normalize_history(hist2)
+        for h1, h2 in _stream_dual(h1, h2, temp, top_p, top_k, max_tokens):
             yield h1, h2
-    elif midx == 0:
-        for h1 in _stream_single(hist1, 0, temp, top_p, top_k, max_tokens):
-            yield_count += 1
-            if yield_count <= 3:
-                _log(f"bot_respond(single/0): yield #{yield_count}, h1_type={type(h1).__name__}, h1_len={len(h1)}")
+    else:
+        # Single: always use chatbot1 for display, pick model by midx
+        h1 = _normalize_history(hist1)
+        for h1 in _stream_single(h1, midx, temp, top_p, top_k, max_tokens):
             yield h1, hist2
-    else:
-        for h2 in _stream_single(hist2, 1, temp, top_p, top_k, max_tokens):
-            yield_count += 1
-            if yield_count <= 3:
-                _log(f"bot_respond(single/1): yield #{yield_count}, h2_type={type(h2).__name__}, h2_len={len(h2)}")
-            yield hist1, h2
 
-    _log(f"bot_respond: EXIT total yields={yield_count}")
-
-
-def delete_last(mode, model_choice, hist1, hist2):
-    midx = _resolve_model_idx(mode, model_choice)
-    if midx == -1:
-        h1 = hist1[:-1] if hist1 else hist1
-        h2 = hist2[:-1] if hist2 else hist2
-        return h1, h2
-    elif midx == 0:
-        return hist1[:-1] if hist1 else hist1, hist2
-    else:
-        return hist1, hist2[:-1] if hist2 else hist2
+    _log("bot_respond: EXIT")
 
 
 def _strip_last_turn(hist):
-    """Remove the last assistant (+ its preceding user) or lone user message.
-    Returns (trimmed_history, user_message) or (hist, None) if nothing to strip."""
+    """Remove the last user+assistant pair (or lone user message).
+    Returns (trimmed_history, user_message_text) or (hist, None)."""
     if not hist:
         return hist, None
     if hist[-1]["role"] == "assistant" and len(hist) >= 2 and hist[-2]["role"] == "user":
-        return hist[:-2], hist[-2]["content"]
+        user_content = hist[-2].get("content", "")
+        return hist[:-2], _normalize_content(user_content)
     if hist[-1]["role"] == "user":
-        return hist[:-1], hist[-1]["content"]
+        user_content = hist[-1].get("content", "")
+        return hist[:-1], _normalize_content(user_content)
     return hist, None
+
+
+def delete_last(mode, model_choice, hist1, hist2):
+    """Delete the last user+assistant turn."""
+    midx = _resolve_model_idx(mode, model_choice)
+    if midx == -1:
+        h1, _ = _strip_last_turn(hist1)
+        h2, _ = _strip_last_turn(hist2)
+        return h1, h2
+    else:
+        # Single mode: history is always in chatbot1
+        h1, _ = _strip_last_turn(hist1)
+        return h1, hist2
 
 
 def regenerate(mode, model_choice, hist1, hist2,
@@ -505,27 +523,23 @@ def regenerate(mode, model_choice, hist1, hist2,
             yield hist1, hist2
             return
         hist2, _ = _strip_last_turn(hist2)
-        hist1 = hist1 + [{"role": "user", "content": user_msg}]
-        hist2 = hist2 + [{"role": "user", "content": user_msg}]
-        for h1, h2 in _stream_dual(hist1, hist2, temp, top_p, top_k, max_tokens):
+        h1 = _normalize_history(hist1) + [{"role": "user", "content": user_msg}]
+        h2 = _normalize_history(hist2) + [{"role": "user", "content": user_msg}]
+        for h1, h2 in _stream_dual(h1, h2, temp, top_p, top_k, max_tokens):
             yield h1, h2
     else:
-        hist = hist1 if midx == 0 else hist2
-        other = hist2 if midx == 0 else hist1
-        hist, user_msg = _strip_last_turn(hist)
+        # Single mode: history is in chatbot1
+        hist1, user_msg = _strip_last_turn(hist1)
         if user_msg is None:
             yield hist1, hist2
             return
-        hist = hist + [{"role": "user", "content": user_msg}]
-        for h in _stream_single(hist, midx, temp, top_p, top_k, max_tokens):
-            if midx == 0:
-                yield h, other
-            else:
-                yield other, h
+        h1 = _normalize_history(hist1) + [{"role": "user", "content": user_msg}]
+        for h1 in _stream_single(h1, midx, temp, top_p, top_k, max_tokens):
+            yield h1, hist2
 
 
 def edit_last(mode, model_choice, hist1, hist2):
-    """Remove the last user+assistant turn and return the user message to the textbox."""
+    """Remove the last user+assistant turn and return the user text to the textbox."""
     midx = _resolve_model_idx(mode, model_choice)
 
     if midx == -1:
@@ -533,12 +547,9 @@ def edit_last(mode, model_choice, hist1, hist2):
         hist2, _ = _strip_last_turn(hist2)
         return hist1, hist2, user_msg or ""
     else:
-        hist = hist1 if midx == 0 else hist2
-        hist, user_msg = _strip_last_turn(hist)
-        if midx == 0:
-            return hist, hist2, user_msg or ""
-        else:
-            return hist1, hist, user_msg or ""
+        # Single mode: history is in chatbot1
+        hist1, user_msg = _strip_last_turn(hist1)
+        return hist1, hist2, user_msg or ""
 
 
 def clear_all():
@@ -550,13 +561,11 @@ def switch_mode(mode):
     """When mode changes, clear history and toggle visibility."""
     _log(f"switch_mode: mode={mode!r}")
     is_dual = mode == "Dual Model"
-    result = (
+    return (
         [],
         gr.Chatbot(value=[], visible=is_dual),
         gr.Dropdown(visible=not is_dual),
     )
-    _log(f"switch_mode: returning types=({type(result[0]).__name__}, {type(result[1]).__name__}, {type(result[2]).__name__})")
-    return result
 
 
 ###############################################################################
