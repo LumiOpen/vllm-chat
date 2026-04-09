@@ -28,6 +28,12 @@ FALLBACK_CHAT_TEMPLATE = (
     "{% if add_generation_prompt %}{{ 'Assistant: ' }}{% endif %}"
 )
 
+
+def _log(msg):
+    """Debug logger — prints with flush so output appears immediately in logs."""
+    print(f"[DEBUG] {msg}", flush=True)
+
+
 ###############################################################################
 # GPU & Argument Parsing
 ###############################################################################
@@ -219,28 +225,40 @@ def truncate_history(msgs: List[Dict[str, str]], tokenizer, max_tokens: int) -> 
 
 
 ###############################################################################
-# Streaming generator
+# Streaming generator (used by dual mode)
 ###############################################################################
 
 
 def stream_from_server(url: str, payload: dict, buffer: list, lock: threading.Lock, done: list):
+    _log(f"stream_from_server: POST {url}")
     try:
         with requests.post(url, json=payload, stream=True) as resp:
-            for raw in resp.iter_lines(decode_unicode=True, delimiter="\n"):
+            _log(f"stream_from_server: response status={resp.status_code}")
+            line_count = 0
+            token_count = 0
+            for raw in resp.iter_lines(decode_unicode=True):
                 if not raw:
                     continue
+                line_count += 1
+                if line_count <= 3:
+                    _log(f"stream_from_server: raw line {line_count}: {raw[:200]}")
                 for data in parse_vllm_sse_line(raw):
                     if data is None:
                         done[0] = True
                         break
                     token = data.get("choices", [{}])[0].get("text", "")
-                    with lock:
-                        buffer[0] += token
+                    if token:
+                        token_count += 1
+                        with lock:
+                            buffer[0] += token
                 if done[0]:
                     break
+            _log(f"stream_from_server: finished. lines={line_count}, tokens={token_count}, buf_len={len(buffer[0])}")
         done[0] = True
     except Exception as e:
-        print("Streaming error:", e)
+        _log(f"stream_from_server: EXCEPTION: {e}")
+        import traceback
+        traceback.print_exc()
         done[0] = True
 
 
@@ -260,15 +278,23 @@ def _resolve_model_idx(mode, model_choice):
 def _stream_single(history: List[Dict], model_idx: int,
                    temp: float, top_p: float, top_k: int, max_tokens: int):
     """Add an assistant placeholder and stream tokens. Yields history."""
+    _log(f"_stream_single: ENTER model_idx={model_idx}, history has {len(history)} msgs")
+    for i, m in enumerate(history):
+        _log(f"  history[{i}]: role={m.get('role')}, type(content)={type(m.get('content')).__name__}, content_preview={str(m.get('content',''))[:80]}")
+
     tok = tokenizers[model_idx]
     port = ports[model_idx]
 
     history = list(history) + [{"role": "assistant", "content": ""}]
     history = truncate_history(history, tok, max_tokens)
+    _log(f"_stream_single: after truncate, history has {len(history)} msgs")
+
+    prompt = format_chat_prompt(history, tok)
+    _log(f"_stream_single: prompt length={len(prompt)} chars, first 200: {prompt[:200]}")
 
     payload = {
         "model": model_names[model_idx],
-        "prompt": format_chat_prompt(history, tok),
+        "prompt": prompt,
         "max_tokens": max_tokens,
         "stream": True,
         "temperature": temp,
@@ -278,31 +304,50 @@ def _stream_single(history: List[Dict], model_idx: int,
     }
 
     url = f"http://localhost:{port}/v1/completions"
+    _log(f"_stream_single: POST {url}")
     last_yield = time.monotonic()
+    yield_count = 0
+    token_count = 0
     try:
         with requests.post(url, json=payload, stream=True) as resp:
+            _log(f"_stream_single: response status={resp.status_code}, headers={dict(resp.headers)}")
+            line_count = 0
             for raw in resp.iter_lines(decode_unicode=True):
                 if not raw:
                     continue
+                line_count += 1
+                if line_count <= 3:
+                    _log(f"_stream_single: SSE line {line_count}: {raw[:200]}")
                 for data in parse_vllm_sse_line(raw):
                     if data is None:
+                        _log(f"_stream_single: got [DONE] after {line_count} lines, {token_count} tokens, {yield_count} yields")
                         yield history
                         return
                     token = data.get("choices", [{}])[0].get("text", "")
                     if token:
+                        token_count += 1
                         history[-1]["content"] += token
                         now = time.monotonic()
                         if now - last_yield >= 0.05:
+                            yield_count += 1
+                            if yield_count <= 5:
+                                _log(f"_stream_single: yield #{yield_count}, tokens_so_far={token_count}, content_len={len(history[-1]['content'])}")
                             yield history
                             last_yield = now
+            _log(f"_stream_single: iter_lines exhausted. lines={line_count}, tokens={token_count}, yields={yield_count}")
     except Exception as e:
-        print("Streaming error:", e)
+        _log(f"_stream_single: EXCEPTION: {e}")
+        import traceback
+        traceback.print_exc()
+    _log(f"_stream_single: EXIT. total yields={yield_count}, final content_len={len(history[-1]['content'])}")
     yield history
 
 
 def _stream_dual(hist1: List[Dict], hist2: List[Dict],
                  temp: float, top_p: float, top_k: int, max_tokens: int):
     """Add assistant placeholders to both histories and stream. Yields (h1, h2)."""
+    _log(f"_stream_dual: ENTER hist1={len(hist1)} msgs, hist2={len(hist2)} msgs")
+
     hist1 = list(hist1) + [{"role": "assistant", "content": ""}]
     hist2 = list(hist2) + [{"role": "assistant", "content": ""}]
 
@@ -337,16 +382,21 @@ def _stream_dual(hist1: List[Dict], hist2: List[Dict],
         daemon=True,
     ).start()
 
+    yield_count = 0
     while not (done1[0] and done2[0]):
         with lock1:
             hist1[-1]["content"] = buf1[0]
         with lock2:
             hist2[-1]["content"] = buf2[0]
+        yield_count += 1
+        if yield_count <= 5:
+            _log(f"_stream_dual: yield #{yield_count}, buf1_len={len(buf1[0])}, buf2_len={len(buf2[0])}, done1={done1[0]}, done2={done2[0]}")
         yield hist1, hist2
         time.sleep(0.1)
 
     hist1[-1]["content"] = buf1[0]
     hist2[-1]["content"] = buf2[0]
+    _log(f"_stream_dual: EXIT. yields={yield_count}, final buf1_len={len(buf1[0])}, buf2_len={len(buf2[0])}")
     yield hist1, hist2
 
 
@@ -357,10 +407,20 @@ def _stream_dual(hist1: List[Dict], hist2: List[Dict],
 
 def user_submit(user_msg, mode, model_choice, hist1, hist2):
     """Add the user message to the correct history and clear the textbox."""
+    _log(f"user_submit: ENTER msg={user_msg!r}, mode={mode!r}, model_choice={model_choice!r}")
+    _log(f"  hist1: type={type(hist1).__name__}, len={len(hist1) if isinstance(hist1, list) else '?'}")
+    _log(f"  hist2: type={type(hist2).__name__}, len={len(hist2) if isinstance(hist2, list) else '?'}")
+    if hist1:
+        _log(f"  hist1[0]: type={type(hist1[0]).__name__}, value={hist1[0]!r}"[:200])
+    if hist2:
+        _log(f"  hist2[0]: type={type(hist2[0]).__name__}, value={hist2[0]!r}"[:200])
+
     if not user_msg or not user_msg.strip():
+        _log("user_submit: empty msg, returning unchanged")
         return user_msg, hist1, hist2
 
     midx = _resolve_model_idx(mode, model_choice)
+    _log(f"user_submit: midx={midx}")
     if midx == -1:
         hist1 = hist1 + [{"role": "user", "content": user_msg}]
         hist2 = hist2 + [{"role": "user", "content": user_msg}]
@@ -368,22 +428,47 @@ def user_submit(user_msg, mode, model_choice, hist1, hist2):
         hist1 = hist1 + [{"role": "user", "content": user_msg}]
     else:
         hist2 = hist2 + [{"role": "user", "content": user_msg}]
+
+    _log(f"user_submit: EXIT returning hist1_len={len(hist1)}, hist2_len={len(hist2)}")
     return "", hist1, hist2
 
 
 def bot_respond(mode, model_choice, hist1, hist2,
                 temp, top_p, top_k, max_tokens):
     """Stream the assistant response. Histories already contain the user message."""
+    _log(f"bot_respond: ENTER mode={mode!r}, model_choice={model_choice!r}")
+    _log(f"  hist1: type={type(hist1).__name__}, len={len(hist1) if isinstance(hist1, list) else '?'}")
+    _log(f"  hist2: type={type(hist2).__name__}, len={len(hist2) if isinstance(hist2, list) else '?'}")
+    if hist1:
+        _log(f"  hist1[-1]: type={type(hist1[-1]).__name__}, value={hist1[-1]!r}"[:200])
+    if hist2:
+        _log(f"  hist2[-1]: type={type(hist2[-1]).__name__}, value={hist2[-1]!r}"[:200])
+    _log(f"  params: temp={temp}, top_p={top_p}, top_k={top_k}, max_tokens={max_tokens}")
+
     midx = _resolve_model_idx(mode, model_choice)
+    _log(f"bot_respond: midx={midx}")
+
+    yield_count = 0
     if midx == -1:
         for h1, h2 in _stream_dual(hist1, hist2, temp, top_p, top_k, max_tokens):
+            yield_count += 1
+            if yield_count <= 3:
+                _log(f"bot_respond(dual): yield #{yield_count}, h1_type={type(h1).__name__}, h2_type={type(h2).__name__}")
             yield h1, h2
     elif midx == 0:
         for h1 in _stream_single(hist1, 0, temp, top_p, top_k, max_tokens):
+            yield_count += 1
+            if yield_count <= 3:
+                _log(f"bot_respond(single/0): yield #{yield_count}, h1_type={type(h1).__name__}, h1_len={len(h1)}")
             yield h1, hist2
     else:
         for h2 in _stream_single(hist2, 1, temp, top_p, top_k, max_tokens):
+            yield_count += 1
+            if yield_count <= 3:
+                _log(f"bot_respond(single/1): yield #{yield_count}, h2_type={type(h2).__name__}, h2_len={len(h2)}")
             yield hist1, h2
+
+    _log(f"bot_respond: EXIT total yields={yield_count}")
 
 
 def delete_last(mode, model_choice, hist1, hist2):
@@ -457,22 +542,28 @@ def edit_last(mode, model_choice, hist1, hist2):
 
 
 def clear_all():
+    _log("clear_all: called")
     return [], []
 
 
 def switch_mode(mode):
     """When mode changes, clear history and toggle visibility."""
+    _log(f"switch_mode: mode={mode!r}")
     is_dual = mode == "Dual Model"
-    return (
+    result = (
         [],
         gr.Chatbot(value=[], visible=is_dual),
         gr.Dropdown(visible=not is_dual),
     )
+    _log(f"switch_mode: returning types=({type(result[0]).__name__}, {type(result[1]).__name__}, {type(result[2]).__name__})")
+    return result
 
 
 ###############################################################################
 # Gradio UI
 ###############################################################################
+
+_log(f"Gradio version: {gr.__version__}")
 
 with gr.Blocks() as demo:
     gr.Markdown("## vLLM Chat Interface")
